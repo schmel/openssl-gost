@@ -1,0 +1,409 @@
+# this file is a library sourced from recipes/*
+
+result_path=$(pwd)
+cd $(dirname "$0")/../
+script_path=$(pwd)
+cd "${result_path}"
+
+result_logs() {
+  # $1 = test name
+  # $2 = status: "ok" / "failed" / "configuration failed" / "expected error"
+  #              "skipped" / "ncat (nc) failed" / "shouldn't work"
+  # $3 = file name: "stunnel" / "error"
+
+  if [ "$2" = "expected error" ]
+    then # expected error - it's ok
+      printf "%-35s\t%s\n" "test $1" "ok"
+     else
+      printf "%-35s\t%s\n" "test $1" "$2"
+     fi
+  if [ "$2" != "ok" ] && [ "$2" != "ncat (nc) failed" ]
+    then
+      printf "%-35s\t%s\n" "test $1" "$2" >> "results.log"
+    fi
+  if [ "$2" = "failed" ] || [ "$2" = "configuration failed" ] || [ "$2" = "shouldn't work" ]
+    then # file with stunnel error logs
+      printf "%-35s\t%s\n" "error logs" "logs/$1.log"
+      cat "$3.log" > "$1.log"
+    else
+      cat "temp.log" >> "results.log" 2>> "stderr_nc.log"
+    fi
+  return 0
+}
+
+exit_logs() {
+  # $1 = test name
+  # $2 = status
+
+  case "$2" in
+    "ok") result_logs "$1" "ok" "UNUSED PATTERN";;
+    "failed") result_logs "$1" "failed" "stunnel";;
+    "configuration failed") result_logs "$1" "configuration failed" "error";;
+    "expected error") result_logs "$1" "expected error" "UNUSED PATTERN";;
+    "skipped") result_logs "$1" "skipped" "error";;
+    "ncat (nc) failed") result_logs "$1" "failed" "stunnel";;
+    "shouldn't work") result_logs "$1" "shouldn't work" "stunnel";;
+  esac
+  return 0
+}
+
+clean_logs() {
+  rm -f "stunnel.log"
+  rm -f "temp.log"
+  rm -f "error.log"
+  rm -f "stderr_nc.log"
+  rm -f "stunnel.conf"
+  return 0
+}
+
+waiting_for() {
+  # waiting for strings ($2 or $3 or $4) to appear in the file $1.log
+
+  mkfifo "fifo"
+  (cat "$1.log"; tail -f "$1.log") > "fifo" 2>> "stderr_nc.log" &
+  pid_tail=$!
+  (sleep 3; echo "TIMEOUT") > "fifo" &
+  pid_timeout=$!
+  grep -q -e "$2" -e "$3" -e "$4" -e "TIMEOUT" "fifo"
+  pid_children=$(ps -o pid,ppid | \
+    awk -v ppid1="${pid_tail}" -v ppid2="${pid_timeout}" \
+      '{if ($2==ppid1 || $2==ppid2) print $1}')
+  kill ${pid_tail} ${pid_timeout} ${pid_children} 2>> "stderr_nc.log"
+  wait ${pid_tail} ${pid_timeout} 2>> "stderr_nc.log"
+  rm -f "fifo"
+  return 0
+}
+
+connecting_ncat() {
+  # $1 = test name
+  # $2 = string to send
+  # $3 = netcat name: "ncat" / "nc"
+
+  result=0
+  mkfifo "nodata"
+  printf "\n%s\n" "test $1" > "stderr_nc.log"
+  cat "nodata" | "$3" -l -p "$http2" -vvv >"temp.log" 2>> "stderr_nc.log" &
+  pid_nc=$!
+  waiting_for "stderr_nc" "Listening" "listening" "QUITTING"
+  if grep -q "istening" "stderr_nc.log"
+    then # Listening or listening
+      if [ "$3" = "ncat" ]
+        then
+          printf "%-35s\t%s\n" "test $1" "$2" | "$3" 127.0.0.1 "$http1" -vv 2>> "stderr_nc.log"
+        else
+          printf "%-35s\t%s\n" "test $1" "$2" | "$3" 127.0.0.1 "$http1" -vv 2>> "stderr_nc.log" &
+        fi
+    else # ncat (nc) failed
+      result=1
+    fi
+  if [  "$3" = ncat ]
+    then
+      waiting_for "stderr_nc" "Closing" "Connection reset by peer" "UNUSED PATTERN"
+    else
+      waiting_for "stderr_nc" "accepted" "from localhost" "Connection reset by peer"
+  fi
+  kill -TERM ${pid_nc} 2>> "stderr_nc.log"
+  cat "stderr_nc.log" >> "stderr.log"
+  echo "somedata" > "nodata"
+  rm -f "nodata"
+  return $result
+}
+
+killing_stunnel() {
+  waiting_for "$1" "Service .* finished" "Sent socket write shutdown" "UNUSED PATTERN"
+  kill -TERM $(tail "stunnel.pid") 2>> "stderr.log"
+  waiting_for "stunnel" "removing pid file" "UNUSED PATTERN" "UNUSED PATTERN"
+  return 0
+}
+
+reload_stunnel() {
+  waiting_for "stunnel" "stunnel.pid" "UNUSED PATTERN" "UNUSED PATTERN"
+  kill -HUP $(tail "stunnel.pid") 2>> "stderr.log"
+  waiting_for "stunnel" "127.0.0.1:${http1}" "UNUSED PATTERN" "UNUSED PATTERN"
+  return 0
+}
+
+expected_success() {
+  # expects to send the s using stunnel
+  # $1 = test name
+  # $2 = netcat name: "ncat" / "nc"
+
+  result=0
+  if [ ! -s "error.log" ]
+    then
+      if connecting_ncat "$1" "success" "$2"
+        then
+          if grep -q "test $1.*success" "temp.log"
+            then
+              exit_code="ok"
+            else # test failed
+              exit_code="failed"
+              result=1
+            fi
+        else # ncat (nc) failed
+          exit_code="ncat (nc) failed"
+          result=1
+        fi
+      killing_stunnel stunnel
+    else # configuration failed
+      exit_code="configuration failed"
+      result=1
+    fi
+  exit_logs "$1" "$exit_code"
+  return $result
+}
+
+expected_failure() {
+  # $1 = test name
+  # $2 = netcat name: "ncat" / "nc"
+
+  result=0
+  if [ ! -s "error.log" ]
+    then
+      if connecting_ncat "$1" "shouldn't work" "$2"
+        then
+          if grep -q "test $1.*shouldn't work" "temp.log"
+            then # ops...stunnel works
+              exit_code="shouldn't work"
+              result=1
+            else
+              exit_code="expected error"
+            fi
+        else # ncat (nc) failed
+          exit_code="ncat (nc) failed"
+          result=1
+        fi
+      killing_stunnel stunnel
+    else # configuration failed, but it is ok
+      exit_code="expected error"
+    fi
+  exit_logs "$1" "$exit_code"
+  return $result
+}
+
+execute_program() {
+  # $1 = test name
+  # $2 = netcat name: "ncat" / "nc"
+
+  result=0
+  mkfifo "nodata"
+  if [ ! -s "error.log" ]
+    then
+      cat "nodata" | "$2" 127.0.0.1 "$http1" -vv > "temp.log" 2>>"stderr.log" &
+      pid_nce=$!
+      killing_stunnel stunnel
+      kill -TERM ${pid_nce} 2>> "stderr.log"
+      echo "somedata" > "nodata" 2>> "stderr.log"
+      rm -f "nodata"
+      if grep -q "test $1.*success" "temp.log"
+        then
+          if grep -q "$1_error" "temp.log"
+            then # only for redirect tests
+              exit_code="failed"
+              result=1
+            else
+              exit_code="ok"
+          fi
+        else # test failed
+          exit_code="failed"
+          result=1
+        fi
+    else # configuration failed
+      exit_code="configuration failed"
+      result=1
+    fi
+  exit_logs "$1" "$exit_code"
+  return $result
+}
+
+loop_prio() {
+  # $1 = test name
+  # $2 = netcat name: "ncat" / "nc"
+
+  result=0
+  i=1
+  max=12
+  start $i 2> "error.log"
+  if [ ! -s "error.log" ]
+    then
+      waiting_for "stunnel" "Created pid file" "UNUSED PATTERN" "UNUSED PATTERN"
+      mv "stunnel.log" "stunnel_0.log"
+      kill -USR1 $(tail "stunnel.pid") 2>> "stderr.log"
+      while [ $i -le $max ] && [ $result -eq 0 ]
+        do
+          if connecting_ncat "$1" "success" "$2"
+            then
+              waiting_for "stunnel" "Service .* finished" "Sent socket write shutdown" "UNUSED PATTERN"
+              if grep -q "test $1.*success" "temp.log"
+                then
+                  if [ $1 = "037_failover_prio1" ]
+                    then
+                      serv="server_2\] accepted connection"
+                    else
+                      serv="server_1\] accepted connection"
+                    fi
+		  if ! grep -q "$serv" "stunnel.log"
+		    then # second server doesn't accept any client
+		      if [ $i -eq $max ]
+			then # last successed turn of the loop
+			  exit_code="ok"
+			fi
+		    else # error - second server accepts a client
+                      exit_code="failed"
+		      result=1
+		    fi
+                else # stunnel doesn't work
+                  exit_code="failed"
+                  result=1
+                fi
+            else # ncat (nc) failed
+              exit_code="ncat (nc) failed"
+              result=1
+            fi
+          waiting_for "stunnel" "Service .* finished" "Sent socket write shutdown" "UNUSED PATTERN"
+          mv "stunnel.log" "stunnel_$i.log"
+          kill -USR1 $(tail "stunnel.pid") 2>> "stderr.log"
+          i=$((i + 1))
+        done
+      cat "stunnel_0.log" > "stunnel_all.log"
+      rm -f "stunnel_0.log"
+      j=1
+      while [ $j -lt $i ]
+        do
+          printf "%s\n" "connection $j" >> "stunnel_all.log"
+          cat "stunnel_$j.log" >> "stunnel_all.log"
+          rm -f "stunnel_$j.log"
+          j=$((j + 1))
+        done
+      killing_stunnel stunnel_all
+      cat "stunnel.log" >> "stunnel_all.log"
+      cat "stunnel_all.log" > "stunnel.log"
+      rm -f "stunnel_all.log"
+    else # configuration failed
+      exit_code="configuration failed"
+      result=1
+    fi
+  exit_logs "$1" "$exit_code"
+  return $result
+}
+
+loop_rr() {
+  # $1 = test name
+  # $2 = netcat name: "ncat" / "nc"
+
+  result=0
+  i=1
+  max=3
+  first=0
+  second=0
+  third=0
+  start $i 2> "error.log"
+  if [ ! -s "error.log" ]
+    then
+      waiting_for "stunnel" "Created pid file" "UNUSED PATTERN" "UNUSED PATTERN"
+      mv "stunnel.log" "stunnel_0.log"
+      kill -USR1 $(tail "stunnel.pid") 2>> "stderr.log"
+      while [ $i -le $max ] && [ $result -eq 0 ]
+        do
+          if connecting_ncat "$1" "success" "$2"
+            then
+              waiting_for "stunnel" "Service .* finished" "Sent socket write shutdown" "UNUSED PATTERN"
+              if ! grep -q "test $1.*success" "temp.log"
+                then # stunnel doesn't work
+                  exit_code="failed"
+                  result=1
+                fi
+            else # ncat (nc) failed
+              exit_code="ncat (nc) failed"
+              result=1
+            fi
+          waiting_for "stunnel" "Service .* finished" "Sent socket write shutdown" "UNUSED PATTERN"
+          mv "stunnel.log" "stunnel_$i.log"
+          kill -USR1 $(tail "stunnel.pid") 2>> "stderr.log"
+          i=$((i + 1))
+        done
+      cat "stunnel_0.log" > "stunnel_all.log"
+      rm -f "stunnel_0.log"
+      j=1
+      while [ $j -lt $i ]
+        do
+          printf "%s\n" "connection $j" >> "stunnel_all.log"
+          cat "stunnel_$j.log" >> "stunnel_all.log"
+          rm -f "stunnel_$j.log"
+          j=$((j + 1))
+        done
+      killing_stunnel stunnel_all
+      cat "stunnel.log" >> "stunnel_all.log"
+      cat "stunnel_all.log" > "stunnel.log"
+      rm -f "stunnel_all.log"
+      first=$(grep -c "server_1\] accepted connection" "stunnel.log")
+      second=$(grep -c "server_2\] accepted connection" "stunnel.log")
+      third=$(grep -c "server_3\] accepted connection" "stunnel.log")
+    else # configuration failed
+      exit_code="configuration failed"
+      result=1
+    fi
+    if [ $result -eq 0 ]
+      then
+        product=$((first * second * third))
+        if [ $product -ne 0 ]
+          then # round robin
+            printf "%-35s\t%s\n" "test $1: $first x $second x $third" "success" > "temp.log"
+            exit_code="ok"
+          else
+            printf "%-35s\t%s\n" "test $1: $first x $second x $third" "failed" > "temp.log"
+            exit_code="failed"
+            result=1
+          fi
+      fi
+  exit_logs "$1" "$exit_code"
+  return $result
+}
+
+test_log_for() {
+  # $1 = test name
+  # $2 = function name
+  # $3 = netcat name: "ncat" / "nc"
+
+  case "$2" in
+    "success") expected_success "$1" "$3";;
+    "failure") expected_failure "$1" "$3";;
+    "execute") execute_program "$1" "$3";;
+    "prio") loop_prio "$1" "$3";;
+    "rr") loop_rr "$1" "$3";;
+  esac
+  result=$?
+  clean_logs
+  return $result
+}
+
+set_port() {
+  port=$((port+1))
+  while netstat -an 2>> "stderr.log" | grep $port | grep -q LISTEN
+    do
+      port=$((port+1))
+    done
+  return 0
+}
+
+check_ports() {
+  port=8079
+  set_port $port
+  http1=$port
+  set_port $port
+  http2=$port
+  set_port $port
+  http3=$port
+
+  port=4432
+  set_port $port
+  https=$port
+  set_port $port
+  https2=$port
+  set_port $port
+  https3=$port
+
+  printf "\n%s\n" "test $1" >> "stderr.log"
+  printf "%s\n" "ports: $http1 $http2 $http3 $https $https2 $https3" >> "stderr.log"
+  return 0
+}
